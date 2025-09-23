@@ -807,6 +807,8 @@ def start_backend():
 
     pnl_stream = None
 
+    account_summary_subscription = None
+
     def _ensure_pnl_stream(account_name: str | None):
         nonlocal account_id, pnl_stream
         if not account_name or pnl_stream is not None:
@@ -817,6 +819,15 @@ def start_backend():
             account_id = account_name
         except Exception:
             pnl_stream = None
+
+    def _ensure_account_summary_subscription():
+        nonlocal account_summary_subscription
+        if account_summary_subscription is not None:
+            return
+        try:
+            account_summary_subscription = ib.reqAccountSummary('All', 'All')
+        except Exception:
+            account_summary_subscription = None
 
     def _capture_account_pnl(*args):
         """Persist latest daily PnL (and optional account value) from reqPnL stream."""
@@ -858,6 +869,7 @@ def start_backend():
                 pnl_state["account_value"] = account_value_candidate
 
     _ensure_pnl_stream(account_id)
+    _ensure_account_summary_subscription()
 
     # Underlying contract + RTVolume (233) for better "last"
     stk = Stock(UNDERLYING_SYMBOL, 'SMART', 'USD', primaryExchange='ARCA')
@@ -992,10 +1004,18 @@ def start_backend():
             now_ts = datetime.now().timestamp()
             if (now_ts - last_account_refresh) >= ACCOUNT_REFRESH_SECONDS:
                 last_account_refresh = now_ts
-                try:
-                    summary_rows = ib.accountSummary()
-                except Exception:
-                    summary_rows = None
+                _ensure_account_summary_subscription()
+                summary_rows = None
+                if account_summary_subscription is not None:
+                    try:
+                        summary_rows = list(account_summary_subscription)
+                    except Exception:
+                        summary_rows = None
+                if summary_rows is None:
+                    try:
+                        summary_rows = ib.accountSummary()
+                    except Exception:
+                        summary_rows = None
                 if summary_rows:
                     tags_of_interest = {
                         "NetLiquidation",
@@ -1119,6 +1139,16 @@ def start_backend():
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
+        try:
+            if pnl_stream is not None:
+                ib.cancelPnL(pnl_stream)
+        except Exception:
+            pass
+        try:
+            if account_summary_subscription is not None:
+                ib.cancelAccountSummary(account_summary_subscription)
+        except Exception:
+            pass
         ib.disconnect()
 
 if __name__ == "__main__":
