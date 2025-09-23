@@ -3,6 +3,7 @@
 
 from nicegui import ui, app
 import httpx
+import math
 
 # ---------------- Config / client ----------------
 BACKEND_URL = 'http://127.0.0.1:8001'
@@ -58,8 +59,15 @@ ui.add_head_html("""
 
 # ----------------- Small helpers -----------------
 def fmt_money(x):
-    try: return f'{float(x):,.2f}'
-    except: return str(x)
+    if x in (None, 'n/a'):
+        return 'n/a'
+    try:
+        value = float(x)
+    except Exception:
+        return str(x)
+    if not math.isfinite(value):
+        return 'n/a'
+    return f'{value:,.2f}'
 
 def fmt_plain(x):
     return '--' if x in (None, 'n/a') else str(x)
@@ -180,6 +188,17 @@ with ui.element('div').classes('panel p-4'):
         ui.label('Protect Price').classes('muted');  lbl_pos_protect = ui.label('-').classes('value')
         ui.label('Protect Status').classes('muted'); lbl_pos_protect_status = ui.label('-').classes('value')
 
+    ui.element('div').classes('divider')
+
+    ui.label('Portfolio').classes('text-sm muted')
+    with ui.element('div')\
+            .classes('mt-1 text-[12px] mono')\
+            .style('display:grid; grid-template-columns: auto 1fr; column-gap:16px; row-gap:6px; align-items:center;'):
+
+        ui.label('Net Liquidity').classes('muted'); lbl_port_net = ui.label('-').classes('value mono')
+        ui.label('Daily PnL').classes('muted');      lbl_port_daily = ui.label('-').classes('value mono')
+        ui.label('Buying Power').classes('muted');   lbl_port_buying = ui.label('-').classes('value mono')
+
     # Disable side toggle whenever a position is open
     side.bind_enabled_from(lbl_pos_status, 'text', lambda s: s == 'flat')
 
@@ -246,6 +265,72 @@ async def poll_snapshot():
             latest_delta = float(delta)
         except:
             latest_delta = None
+
+        portfolio = d.get('portfolio') if isinstance(d.get('portfolio'), dict) else {}
+
+        net_liq_val = portfolio.get('net_liquidity')
+        try:
+            net_liq_num = float(net_liq_val)
+            if not math.isfinite(net_liq_num):
+                raise ValueError
+        except Exception:
+            net_liq_num = None
+        if net_liq_num is None:
+            lbl_port_net.text = 'n/a'
+            lbl_port_net.classes(replace='value mono muted')
+        else:
+            lbl_port_net.text = fmt_money(net_liq_num)
+            lbl_port_net.classes(replace='value mono')
+
+        buying_power_val = portfolio.get('buying_power')
+        try:
+            buying_power_num = float(buying_power_val)
+            if not math.isfinite(buying_power_num):
+                raise ValueError
+        except Exception:
+            buying_power_num = None
+        if buying_power_num is None:
+            lbl_port_buying.text = 'n/a'
+            lbl_port_buying.classes(replace='value mono muted')
+        else:
+            lbl_port_buying.text = fmt_money(buying_power_num)
+            lbl_port_buying.classes(replace='value mono')
+
+        daily_pnl_val = portfolio.get('daily_pnl')
+        try:
+            daily_pnl_num = float(daily_pnl_val)
+            if not math.isfinite(daily_pnl_num):
+                raise ValueError
+        except Exception:
+            daily_pnl_num = None
+
+        daily_pct_val = portfolio.get('daily_pnl_pct')
+        pct_display = ''
+        pct_num = None
+        try:
+            pct_candidate = float(daily_pct_val)
+            if math.isfinite(pct_candidate):
+                pct_num = pct_candidate
+        except Exception:
+            pct_num = None
+        if pct_num is not None:
+            sign = '+' if pct_num > 0 else ''
+            pct_display = f" ({sign}{pct_num:.2f}%)"
+        elif daily_pct_val not in (None, 'n/a'):
+            pct_display = f" ({daily_pct_val})"
+
+        if daily_pnl_num is None:
+            lbl_port_daily.text = 'n/a'
+            lbl_port_daily.classes(replace='value mono muted')
+        else:
+            pnl_text = fmt_money(daily_pnl_num)
+            lbl_port_daily.text = f"{pnl_text}{pct_display}"
+            if daily_pnl_num > 0:
+                lbl_port_daily.classes(replace='value mono green')
+            elif daily_pnl_num < 0:
+                lbl_port_daily.classes(replace='value mono red')
+            else:
+                lbl_port_daily.classes(replace='value mono')
     except Exception:
         # footer status (disconnected)
         lbl_status.text = 'Disconnected'
