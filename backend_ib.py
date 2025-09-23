@@ -794,6 +794,71 @@ def start_backend():
     ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
     ib.reqMarketDataType(1)  # 1=LIVE
 
+    # --- Track account-level daily PnL via streaming subscription -----------------
+    managed_accounts: list[str] = []
+    try:
+        managed_accounts = ib.managedAccounts()
+    except Exception:
+        managed_accounts = []
+    account_id: str | None = managed_accounts[0] if managed_accounts else None
+
+    pnl_state_lock = threading.Lock()
+    pnl_state: dict[str, float | None] = {"daily": None, "account_value": None}
+
+    pnl_stream = None
+
+    def _ensure_pnl_stream(account_name: str | None):
+        nonlocal account_id, pnl_stream
+        if not account_name or pnl_stream is not None:
+            return
+        try:
+            pnl_stream = ib.reqPnL(account=account_name, modelCode='')
+            pnl_stream.updateEvent += _capture_account_pnl
+            account_id = account_name
+        except Exception:
+            pnl_stream = None
+
+    def _capture_account_pnl(*args):
+        """Persist latest daily PnL (and optional account value) from reqPnL stream."""
+
+        daily_candidate = None
+        account_value_candidate = None
+
+        for source in args:
+            if source is None:
+                continue
+            if daily_candidate is None:
+                raw_daily = getattr(source, 'dailyPnL', None)
+                if raw_daily is not None:
+                    try:
+                        daily_float = float(raw_daily)
+                    except Exception:
+                        daily_float = None
+                    else:
+                        if math.isfinite(daily_float):
+                            daily_candidate = daily_float
+            if account_value_candidate is None:
+                raw_value = getattr(source, 'value', None)
+                if raw_value is not None:
+                    try:
+                        value_float = float(raw_value)
+                    except Exception:
+                        value_float = None
+                    else:
+                        if math.isfinite(value_float):
+                            account_value_candidate = value_float
+
+        if daily_candidate is None and account_value_candidate is None:
+            return
+
+        with pnl_state_lock:
+            if daily_candidate is not None:
+                pnl_state["daily"] = daily_candidate
+            if account_value_candidate is not None:
+                pnl_state["account_value"] = account_value_candidate
+
+    _ensure_pnl_stream(account_id)
+
     # Underlying contract + RTVolume (233) for better "last"
     stk = Stock(UNDERLYING_SYMBOL, 'SMART', 'USD', primaryExchange='ARCA')
     ib.qualifyContracts(stk)
@@ -939,7 +1004,7 @@ def start_backend():
                         "BuyingPower",
                         "AvailableFunds",
                     }
-                    summary_map: dict[str, str] = {}
+                    per_account: dict[str, dict[str, str]] = {}
                     for row in summary_rows:
                         tag = getattr(row, 'tag', None)
                         if tag not in tags_of_interest:
@@ -947,12 +1012,36 @@ def start_backend():
                         currency = getattr(row, 'currency', None)
                         if currency and currency not in ('USD', ''):
                             continue
-                        summary_map[tag] = getattr(row, 'value', None)
+                        acct = getattr(row, 'account', None) or ''
+                        if account_id and acct and acct != account_id:
+                            continue
+                        acct_map = per_account.setdefault(acct, {})
+                        acct_map[tag] = getattr(row, 'value', None)
+
+                    summary_map: dict[str, str] = {}
+                    if account_id and account_id in per_account:
+                        summary_map = per_account[account_id]
+                    elif per_account:
+                        first_account = next(iter(per_account))
+                        summary_map = per_account[first_account]
+                        if first_account and not account_id:
+                            account_id = first_account
+                        if first_account:
+                            _ensure_pnl_stream(first_account)
 
                     net_liq = _to_float(summary_map.get('NetLiquidation'))
+                    with pnl_state_lock:
+                        fallback_daily = pnl_state.get('daily')
+                        fallback_value = pnl_state.get('account_value')
+                    if net_liq is None and fallback_value is not None:
+                        net_liq = float(fallback_value)
+
                     daily_pnl = _to_float(summary_map.get('DailyPnL'))
                     if daily_pnl is None:
                         daily_pnl = _to_float(summary_map.get('PnL'))
+                    if daily_pnl is None and fallback_daily is not None:
+                        daily_pnl = float(fallback_daily)
+
                     buying_power_val = _to_float(summary_map.get('BuyingPower'))
                     if buying_power_val is None:
                         buying_power_val = _to_float(summary_map.get('AvailableFunds'))
