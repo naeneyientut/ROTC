@@ -138,6 +138,7 @@ class Position:
         self.protect_ratio = 1.0
         self.protect_triggered = False
         self.last_protect_price = None
+        self.entry_qty = 0
 
 class PositionManager:
     def __init__(self, ib: IB):
@@ -287,6 +288,7 @@ class PositionManager:
                 self.pos = Position(self.contract.localSymbol, self.contract.conId)
             self.pos.local_symbol = self.contract.localSymbol
             self.pos.con_id = self.contract.conId
+            prev_auto_protect = bool(self.pos.auto_protect_enabled)
 
             new_qty = self.pos.qty + filled
             if new_qty > 0:
@@ -313,6 +315,12 @@ class PositionManager:
                     ratio_value = max(1.0, ratio_value)
             self.pos.auto_protect_enabled = enable_protect
             self.pos.protect_ratio = ratio_value if enable_protect else 0.0
+
+            if self.pos.auto_protect_enabled:
+                if was_inactive or not prev_auto_protect:
+                    self.pos.entry_qty = int(self.pos.qty)
+                else:
+                    self.pos.entry_qty = max(int(self.pos.entry_qty or 0), int(self.pos.qty))
 
             # --- set fixed anchors ONLY on first activation (opening trade) ---
             if was_inactive and self.pos.active:
@@ -371,6 +379,18 @@ class PositionManager:
                 self.pos.entry_delta_abs = None
                 self.pos.fixed_stop_price = None
                 self.pos.fixed_protect_price = None
+                self.pos.entry_qty = 0
+            else:
+                if (
+                    self.pos.auto_protect_enabled
+                    and not self.pos.protect_triggered
+                    and self.pos.entry_qty
+                    and int(self.pos.qty) < int(self.pos.entry_qty)
+                ):
+                    self.pos.auto_protect_enabled = False
+                    self.pos.protect_ratio = 0.0
+                    self.pos.fixed_protect_price = None
+                    self.pos.last_protect_price = None
 
         return {"sold": filled, "avg_price": round(avg, 4), "remaining": int(self.pos.qty)}
 
@@ -391,7 +411,9 @@ class PositionManager:
 
             # Use fixed anchors (no recompute)
             stop_price = self.pos.fixed_stop_price
-            protect_price = self.pos.fixed_protect_price
+            protect_price = (
+                self.pos.fixed_protect_price if self.pos.auto_protect_enabled else None
+            )
 
             # keep UI mirrors updated
             self.pos.last_stop_price = stop_price
@@ -434,6 +456,7 @@ class PositionManager:
                     self.pos.entry_delta_abs = None
                     self.pos.fixed_stop_price = None
                     self.pos.fixed_protect_price = None
+                    self.pos.entry_qty = 0
                 elif mark_protected and filled > 0:
                     self.pos.protect_triggered = True
         except OrderExecutionError as oe:
