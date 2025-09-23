@@ -28,6 +28,7 @@ UNDERLYING_SYMBOL: str = 'SPY'
 OPTION_RIGHT: str      = 'C'            # default; UI can change via /set_right
 OPTION_EXCHANGE: str   = 'SMART'
 REFRESH_SECONDS: float = 0.25
+ACCOUNT_REFRESH_SECONDS: float = 1.0   # cadence for account summary refresh
 
 BACKEND_HOST = '127.0.0.1'
 BACKEND_PORT = 8001
@@ -109,6 +110,12 @@ _snapshot = {
     "ask": "n/a",
     "delta": "n/a",
     "iv": "n/a",
+    "portfolio": {
+        "net_liquidity": None,
+        "daily_pnl": None,
+        "daily_pnl_pct": None,
+        "buying_power": None,
+    },
 }
 _snapshot_lock = threading.Lock()
 
@@ -889,6 +896,7 @@ def start_backend():
             _snapshot["contract"] = readable2
 
     # Main loop
+    last_account_refresh = 0.0
     try:
         while True:
             ib.sleep(REFRESH_SECONDS)
@@ -914,6 +922,82 @@ def start_backend():
                         desired = pick_nearest_otm_cached(_cached_strikes, und_px_live, _engine["right"])
                         if _current_strike is None or float(desired) != _current_strike:
                             reseat_option(desired)
+
+            # ---- Periodically refresh account summary / portfolio snapshot ----
+            now_ts = datetime.now().timestamp()
+            if (now_ts - last_account_refresh) >= ACCOUNT_REFRESH_SECONDS:
+                last_account_refresh = now_ts
+                try:
+                    summary_rows = ib.accountSummary()
+                except Exception:
+                    summary_rows = None
+                if summary_rows:
+                    tags_of_interest = {
+                        "NetLiquidation",
+                        "DailyPnL",
+                        "PnL",
+                        "BuyingPower",
+                        "AvailableFunds",
+                    }
+                    summary_map: dict[str, str] = {}
+                    for row in summary_rows:
+                        tag = getattr(row, 'tag', None)
+                        if tag not in tags_of_interest:
+                            continue
+                        currency = getattr(row, 'currency', None)
+                        if currency and currency not in ('USD', ''):
+                            continue
+                        summary_map[tag] = getattr(row, 'value', None)
+
+                    net_liq = _to_float(summary_map.get('NetLiquidation'))
+                    daily_pnl = _to_float(summary_map.get('DailyPnL'))
+                    if daily_pnl is None:
+                        daily_pnl = _to_float(summary_map.get('PnL'))
+                    buying_power_val = _to_float(summary_map.get('BuyingPower'))
+                    if buying_power_val is None:
+                        buying_power_val = _to_float(summary_map.get('AvailableFunds'))
+
+                    daily_pct = None
+                    if (
+                        net_liq is not None and math.isfinite(net_liq)
+                        and daily_pnl is not None and math.isfinite(daily_pnl)
+                    ):
+                        prior_close_value = net_liq - daily_pnl
+                        if prior_close_value:
+                            daily_pct = (daily_pnl / prior_close_value) * 100.0
+
+                    net_liq_val = (
+                        round(net_liq, 2)
+                        if (net_liq is not None and math.isfinite(net_liq))
+                        else None
+                    )
+                    daily_pnl_val = (
+                        round(daily_pnl, 2)
+                        if (daily_pnl is not None and math.isfinite(daily_pnl))
+                        else None
+                    )
+                    daily_pct_val = (
+                        round(daily_pct, 2)
+                        if (daily_pct is not None and math.isfinite(daily_pct))
+                        else None
+                    )
+                    buying_power_num = (
+                        round(buying_power_val, 2)
+                        if (buying_power_val is not None and math.isfinite(buying_power_val))
+                        else None
+                    )
+
+                    with _snapshot_lock:
+                        portfolio = _snapshot.get('portfolio')
+                        if not isinstance(portfolio, dict):
+                            portfolio = {}
+                            _snapshot['portfolio'] = portfolio
+                        portfolio.update({
+                            "net_liquidity": net_liq_val,
+                            "daily_pnl": daily_pnl_val,
+                            "daily_pnl_pct": daily_pct_val,
+                            "buying_power": buying_power_num,
+                        })
 
             # ---- Update snapshot ----
             now_str = datetime.now().strftime('%H:%M:%S')
