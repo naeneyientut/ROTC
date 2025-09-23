@@ -8,6 +8,7 @@
 #   POST /buy   {stop_on_spy,max_loss_usd}  (auto-size)
 #               or {qty,stop_on_spy,max_loss_usd} (manual)
 #   POST /sell  {qty} or {mode:"half"|"all"}
+#   POST /auto_protect {enabled, protect_ratio?}
 #   POST /set_right {"right":"C"|"P"}  → reselect option (requires flat)
 
 from ib_insync import IB, Stock, Option, MarketOrder
@@ -389,10 +390,59 @@ class PositionManager:
                 ):
                     self.pos.auto_protect_enabled = False
                     self.pos.protect_ratio = 0.0
+                    self.pos.protect_triggered = False
                     self.pos.fixed_protect_price = None
                     self.pos.last_protect_price = None
+                    self.pos.entry_qty = int(self.pos.qty)
 
         return {"sold": filled, "avg_price": round(avg, 4), "remaining": int(self.pos.qty)}
+
+    def update_auto_protect(self, enabled: bool, protect_ratio: float | None) -> dict:
+        with position_lock:
+            if not self.pos or not self.pos.active or self.pos.qty <= 0:
+                return {"error": "No open position"}
+
+            if not enabled:
+                self.pos.auto_protect_enabled = False
+                self.pos.protect_ratio = 0.0
+                self.pos.protect_triggered = False
+                self.pos.fixed_protect_price = None
+                self.pos.last_protect_price = None
+                self.pos.entry_qty = int(self.pos.qty)
+                return {
+                    "auto_protect": False,
+                    "protect_ratio": None,
+                    "protect_price": None,
+                }
+
+            if protect_ratio is None:
+                return {"error": "protect_ratio required when enabling"}
+            try:
+                ratio_value = float(protect_ratio)
+            except Exception:
+                return {"error": "Invalid protect_ratio"}
+            if ratio_value < 1:
+                return {"error": "protect_ratio must be ≥ 1"}
+
+            if self.pos.entry_delta_abs is None or self.pos.entry_delta_abs <= 0:
+                return {"error": "Cannot enable auto protect without entry delta"}
+            if self.pos.stop_on_spy <= 0:
+                return {"error": "Cannot enable auto protect without stop distance"}
+
+            self.pos.auto_protect_enabled = True
+            self.pos.protect_ratio = ratio_value
+            self.pos.protect_triggered = False
+            self.pos.fixed_protect_price = round(
+                self.pos.avg_price + (self.pos.entry_delta_abs * self.pos.stop_on_spy * ratio_value),
+                4,
+            )
+            self.pos.last_protect_price = self.pos.fixed_protect_price
+            self.pos.entry_qty = int(self.pos.qty)
+            return {
+                "auto_protect": True,
+                "protect_ratio": round(ratio_value, 4),
+                "protect_price": self.pos.fixed_protect_price,
+            }
 
     def monitor_auto_stop(self):
         """Server-side stop: if bid <= fixed_stop, liquidate remaining qty at market.
@@ -675,6 +725,38 @@ def sell():
         return jsonify({"error": str(e)}), 500
     if "error" in result:
         return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.post('/auto_protect')
+def auto_protect_toggle():
+    if not pos_manager:
+        return jsonify({"error": "Engine not ready"}), 503
+
+    data = request.get_json(force=True) or {}
+    if 'enabled' not in data:
+        return jsonify({"error": "enabled is required"}), 400
+
+    enabled = bool(data.get('enabled'))
+    ratio_value = None
+    if enabled:
+        if 'protect_ratio' not in data:
+            return jsonify({"error": "protect_ratio required when enabling"}), 400
+        try:
+            ratio_value = float(data.get('protect_ratio'))
+        except Exception:
+            return jsonify({"error": "Invalid protect_ratio"}), 400
+        if ratio_value < 1:
+            return jsonify({"error": "protect_ratio must be ≥ 1"}), 400
+
+    try:
+        result = submit_ib_job(pos_manager.update_auto_protect, enabled, ratio_value)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if isinstance(result, dict) and "error" in result:
+        return jsonify(result), 400
+
     return jsonify(result)
 
 @app.post('/set_right')
