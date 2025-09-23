@@ -17,6 +17,7 @@ _is_switching_side = False    # debounce side switching
 last_backend_qty = None
 user_qty_dirty = False
 _setting_qty_programmatically = False
+_setting_auto_protect_programmatically = False
 
 
 # Fixed window (optional when running as native window)
@@ -322,7 +323,7 @@ async def poll_position_size():
 
 async def poll_positions():
     """Show open position and sync qty field only when backend qty changes."""
-    global last_backend_qty
+    global last_backend_qty, _setting_auto_protect_programmatically
     try:
         r = await client.get(f'{BACKEND_URL}/positions')
         r.raise_for_status()
@@ -370,6 +371,12 @@ async def poll_positions():
     auto_protect_enabled = p.get('auto_protect')
     protect_ratio = p.get('protect_ratio')
     protect_triggered = p.get('protect_triggered')
+
+    desired_toggle = bool(auto_protect_enabled)
+    if bool(auto_protect.value) != desired_toggle:
+        _setting_auto_protect_programmatically = True
+        auto_protect.value = desired_toggle
+        _setting_auto_protect_programmatically = False
 
     lbl_pos_contracts.text = fmt_plain(qty)
     lbl_pos_strike.text    = fmt_plain(strike)
@@ -421,6 +428,70 @@ def on_toggle_auto(_):
     else:
         qty_in.enable();  loss_in.disable()
 auto_sz.on('update:model-value', on_toggle_auto)
+
+async def on_auto_protect_toggle(e):
+    global _setting_auto_protect_programmatically
+    if _setting_auto_protect_programmatically or lbl_pos_status.text != 'open':
+        return
+
+    desired_state = bool(auto_protect.value)
+    previous_state = not desired_state
+    payload = {"enabled": desired_state}
+
+    if desired_state:
+        if not protect_ratio.value:
+            ui.notify('Enter R:R Ratio', color='warning')
+            _setting_auto_protect_programmatically = True
+            auto_protect.value = previous_state
+            _setting_auto_protect_programmatically = False
+            return
+        try:
+            ratio_val = float(protect_ratio.value)
+        except Exception:
+            ui.notify('R:R Ratio must be a number', color='warning')
+            _setting_auto_protect_programmatically = True
+            auto_protect.value = previous_state
+            _setting_auto_protect_programmatically = False
+            return
+        if ratio_val < 1:
+            ui.notify('R:R Ratio must be at least 1', color='warning')
+            _setting_auto_protect_programmatically = True
+            auto_protect.value = previous_state
+            _setting_auto_protect_programmatically = False
+            return
+        payload["protect_ratio"] = ratio_val
+
+    try:
+        r = await client.post(f'{BACKEND_URL}/auto_protect', json=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        if r.status_code != 200:
+            message = data.get('error') if isinstance(data, dict) else None
+            if not message:
+                message = f'HTTP {r.status_code}'
+            ui.notify(message, color='negative')
+            _setting_auto_protect_programmatically = True
+            auto_protect.value = previous_state
+            _setting_auto_protect_programmatically = False
+            return
+
+        if desired_state:
+            ui.notify('Auto Protect enabled', color='positive')
+            if isinstance(data, dict):
+                new_ratio = data.get('protect_ratio')
+                if isinstance(new_ratio, (int, float)):
+                    protect_ratio.value = f'{float(new_ratio):g}'
+        else:
+            ui.notify('Auto Protect disabled', color='positive')
+    except Exception as ex:
+        ui.notify(f'Auto Protect update failed: {ex}', color='negative')
+        _setting_auto_protect_programmatically = True
+        auto_protect.value = previous_state
+        _setting_auto_protect_programmatically = False
+
+auto_protect.on('update:model-value', on_auto_protect_toggle)
 
 async def on_side_change(e):
     global current_side, _is_switching_side
