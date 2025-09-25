@@ -22,7 +22,7 @@ _setting_qty_programmatically = False
 
 # Fixed window (optional when running as native window)
 try:
-    app.native.window_args['resizable'] = False
+    app.native.window_args['resizable'] = True
 except Exception:
     pass
 
@@ -610,4 +610,4 @@ async def do_sell():
         ui.notify(f'Sell failed: {e}', color='negative')
 btn_sell.on('click', do_sell)
 
-ui.run(title='Order Entry – IBKR', window_size=(460, 870), fullscreen=False, reload=False, port=8080)
+ui.run(title='Rapid Options Trader Cockpit for IBKR', window_size=(460, 970), fullscreen=False, reload=False, port=8080)

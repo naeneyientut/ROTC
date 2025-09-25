@@ -33,9 +33,9 @@ ACCOUNT_REFRESH_SECONDS: float = 1.0   # cadence for account summary refresh
 BACKEND_HOST = '127.0.0.1'
 BACKEND_PORT = 8001
 
-# --- NEW: strict OTM enforcement (auto-roll when flat) -----------------------
-ENFORCE_STRICT_OTM = True           # always stream the nearest strictly OTM when flat
-MIN_SWITCH_INTERVAL = 0.5           # seconds, tiny debounce to avoid flapping
+# --- Strict OTM enforcement (auto-roll when flat) ----------------------------
+ENFORCE_STRICT_OTM = True
+MIN_SWITCH_INTERVAL = 0.5  # seconds (debounce)
 
 # ------------- Helpers ------------------
 def pick_nearest_by_key(items, key_func):
@@ -63,7 +63,7 @@ def pick_nearest_otm_strike(strike_values, underlying_price, option_right):
         if otm: return otm[-1]
     return pick_nearest_by_key(unique_sorted_strikes, key_func=lambda k: abs(k - underlying_price))
 
-# NEW: fast strict-OTM pick from a cached sorted list (no abs fallback)
+# Fast strict-OTM pick from a cached sorted list (no abs fallback)
 def pick_nearest_otm_cached(sorted_strikes, und_px, right):
     if right == 'C':
         for s in sorted_strikes:
@@ -103,9 +103,9 @@ _snapshot = {
     "time": "--:--:--",
     "status": "starting",
     "underlying": UNDERLYING_SYMBOL,
-    "right": OPTION_RIGHT,      # <-- expose current right
+    "right": OPTION_RIGHT,      # current right
     "spy_price": "n/a",
-    "contract": "n/a",          # human-readable name sent to UI
+    "contract": "n/a",          # human-readable name
     "bid": "n/a",
     "ask": "n/a",
     "delta": "n/a",
@@ -127,7 +127,7 @@ class OrderExecutionError(RuntimeError):
 
 class Position:
     def __init__(self, local_symbol, con_id):
-        self.local_symbol = local_symbol   # IB machine label (keep)
+        self.local_symbol = local_symbol
         self.con_id = con_id
         self.qty = 0
         self.avg_price = 0.0
@@ -135,12 +135,12 @@ class Position:
         self.max_loss_usd = 0.0
         self.active = False
 
-        # --- fixed-on-entry risk anchors (NEW) ---
-        self.entry_delta_abs = None         # |delta| captured at first activation
-        self.fixed_stop_price = None        # computed once, remains fixed while open
-        self.fixed_protect_price = None     # computed once, remains fixed while open
+        # fixed-on-entry risk anchors
+        self.entry_delta_abs = None
+        self.fixed_stop_price = None
+        self.fixed_protect_price = None
 
-        self.last_stop_price = None         # cached for UI
+        self.last_stop_price = None
         self.auto_protect_enabled = False
         self.protect_ratio = 1.0
         self.protect_triggered = False
@@ -150,8 +150,8 @@ class PositionManager:
     def __init__(self, ib: IB):
         self.ib = ib
         self.pos: Position | None = None
-        self.contract = None          # Option contract (set by main loop)
-        self._liquidating = False     # prevent double fire
+        self.contract = None
+        self._liquidating = False
 
     def has_open(self) -> bool:
         with position_lock:
@@ -183,7 +183,7 @@ class PositionManager:
 
             return {
                 "status": "open",
-                "contract": self.pos.local_symbol,  # machine label
+                "contract": self.pos.local_symbol,
                 "contract_readable": readable_name(
                     self.contract.symbol,
                     self.contract.lastTradeDateOrContractMonth,
@@ -192,7 +192,7 @@ class PositionManager:
                 ) if self.contract else None,
                 "qty": int(self.pos.qty),
                 "avg_price": round(self.pos.avg_price, 4),
-                "calc_stop_price": self.pos.fixed_stop_price,             # fixed
+                "calc_stop_price": self.pos.fixed_stop_price,
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,
@@ -200,18 +200,17 @@ class PositionManager:
                 "strike": float(self.contract.strike) if self.contract else None,
                 "right": self.contract.right if self.contract else None,
 
-                # include inputs & derived risk numbers so UI can display them
+                # inputs & derived risk numbers
                 "stop_on_spy": round(self.pos.stop_on_spy, 4),
                 "max_loss_usd": round(self.pos.max_loss_usd, 2),
                 "loss_per_contract": loss_per_contract,
                 "auto_protect": bool(self.pos.auto_protect_enabled),
                 "protect_ratio": round(self.pos.protect_ratio, 4) if self.pos.auto_protect_enabled else None,
                 "protect_triggered": bool(self.pos.protect_triggered),
-                "calc_protect_price": self.pos.fixed_protect_price,       # fixed
+                "calc_protect_price": self.pos.fixed_protect_price,
             }
 
     def _await_fill(self, trade) -> tuple[int, float]:
-        """Wait for an order to finish while surfacing broker rejections early."""
         error_states = {'Rejected', 'Cancelled', 'ApiCancelled', 'Error', 'Inactive'}
         last_log_idx = 0
 
@@ -248,7 +247,6 @@ class PositionManager:
         return shares, avg
 
     def _format_trade_failure(self, trade, status_hint: str | None = None) -> str:
-        """Create a readable error message from IB trade logs."""
         error_statuses = {'Error', 'Rejected', 'Cancelled', 'ApiCancelled', 'Inactive'}
         messages: list[str] = []
         for entry in getattr(trade, 'log', []) or []:
@@ -279,7 +277,7 @@ class PositionManager:
         max_loss_usd: float,
         auto_protect: bool = False,
         protect_ratio: float | None = None,
-        entry_delta_abs: float | None = None,   # NEW: capture |delta| once
+        entry_delta_abs: float | None = None,
     ) -> dict:
         if qty <= 0:
             return {"error": "qty must be > 0"}
@@ -321,14 +319,14 @@ class PositionManager:
             self.pos.auto_protect_enabled = enable_protect
             self.pos.protect_ratio = ratio_value if enable_protect else 0.0
 
-            # --- set fixed anchors ONLY on first activation (opening trade) ---
+            # set fixed anchors ONLY on first activation
             if was_inactive and self.pos.active:
                 if entry_delta_abs is None or not math.isfinite(entry_delta_abs):
                     with _snapshot_lock:
                         entry_delta_abs = abs(_to_float(_snapshot.get('delta')) or 0.0)
                 self.pos.entry_delta_abs = float(max(0.0, entry_delta_abs))
 
-                # compute fixed stop once
+                # fixed stop once
                 if self.pos.entry_delta_abs > 0 and self.pos.stop_on_spy > 0:
                     self.pos.fixed_stop_price = round(
                         self.pos.avg_price - (self.pos.entry_delta_abs * self.pos.stop_on_spy), 4
@@ -336,7 +334,7 @@ class PositionManager:
                 else:
                     self.pos.fixed_stop_price = None
 
-                # compute fixed protect once (only if enabled)
+                # fixed protect once
                 if self.pos.auto_protect_enabled and self.pos.protect_ratio > 0 and self.pos.entry_delta_abs > 0:
                     self.pos.fixed_protect_price = round(
                         self.pos.avg_price + (self.pos.entry_delta_abs * self.pos.stop_on_spy * self.pos.protect_ratio), 4
@@ -374,7 +372,7 @@ class PositionManager:
                 self.pos.protect_triggered = False
                 self.pos.protect_ratio = 0.0
                 self.pos.last_protect_price = None
-                # clear anchors (NEW)
+                # clear anchors
                 self.pos.entry_delta_abs = None
                 self.pos.fixed_stop_price = None
                 self.pos.fixed_protect_price = None
@@ -382,9 +380,7 @@ class PositionManager:
         return {"sold": filled, "avg_price": round(avg, 4), "remaining": int(self.pos.qty)}
 
     def monitor_auto_stop(self):
-        """Server-side stop: if bid <= fixed_stop, liquidate remaining qty at market.
-           Auto-protect: if bid >= fixed_protect (first time), sell half.
-        """
+        """Server-side stop: if bid <= fixed_stop, liquidate; protect: first touch sell half."""
         action = None
         sell_qty = 0
         mark_protected = False
@@ -396,11 +392,9 @@ class PositionManager:
             if bid is None or not math.isfinite(bid):
                 return
 
-            # Use fixed anchors (no recompute)
             stop_price = self.pos.fixed_stop_price
             protect_price = self.pos.fixed_protect_price
 
-            # keep UI mirrors updated
             self.pos.last_stop_price = stop_price
             self.pos.last_protect_price = protect_price
 
@@ -437,7 +431,7 @@ class PositionManager:
                     self.pos.protect_triggered = False
                     self.pos.protect_ratio = 0.0
                     self.pos.last_protect_price = None
-                    # clear anchors (NEW)
+                    # clear anchors
                     self.pos.entry_delta_abs = None
                     self.pos.fixed_stop_price = None
                     self.pos.fixed_protect_price = None
@@ -462,7 +456,7 @@ _engine = {
     "display_name": None,   # human-readable label
 }
 
-# NEW: cached strikes / current selection / debounce
+# Cached strikes / current selection / debounce
 _cached_strikes = []
 _current_strike = None
 _current_exp = None
@@ -505,12 +499,12 @@ def position_size():
     if delta is None or stop_on_spy <= 0 or max_loss_usd <= 0:
         return jsonify({"error": "Need live delta and positive inputs"}), 400
 
-    delta_abs = abs(delta)  # use magnitude for risk sizing
+    delta_abs = abs(delta)
     loss_per_contract = delta_abs * stop_on_spy * 100
-    suggested = int(max_loss_usd // loss_per_contract)  # floor
+    suggested = int(max_loss_usd // loss_per_contract)
 
     return jsonify({
-        "delta": round(delta, 4),  # keep original sign for display
+        "delta": round(delta, 4),
         "stop_on_spy": stop_on_spy,
         "max_loss_usd": max_loss_usd,
         "loss_per_contract": round(loss_per_contract, 2),
@@ -527,7 +521,6 @@ def buy():
     Body JSON:
       Auto size: { "stop_on_spy": 0.25, "max_loss_usd": 500 }
       Manual   : { "qty": 3, "stop_on_spy": 0.25 }
-                 (max_loss_usd will be computed from live delta)
     """
     if not pos_manager:
         return jsonify({"error": "Engine not ready"}), 503
@@ -541,7 +534,7 @@ def buy():
         return jsonify({"error": "stop_on_spy must be > 0"}), 400
 
     qty_override = data.get('qty', data.get('override_qty'))
-    max_loss_usd = data.get('max_loss_usd')  # only used in auto-size
+    max_loss_usd = data.get('max_loss_usd')
     auto_protect_flag = bool(data.get('auto_protect'))
     protect_ratio_raw = data.get('protect_ratio')
     protect_ratio_value = None
@@ -553,14 +546,12 @@ def buy():
         if protect_ratio_value < 1:
             return jsonify({"error": "protect_ratio must be ≥ 1"}), 400
 
-    # Need live delta for both auto and manual (for projected loss & stop calc sanity)
     with _snapshot_lock:
         delta = _to_float(_snapshot.get('delta'))
-
     if delta is None or not math.isfinite(delta):
         return jsonify({"error": "No live delta yet"}), 503
 
-    delta_abs = abs(delta)  # use magnitude for risk sizing
+    delta_abs = abs(delta)
 
     if qty_override is None:
         try:
@@ -574,7 +565,7 @@ def buy():
         if loss_per_contract <= 0:
             return jsonify({"error": "Sizing failed: zero loss_per_contract"}), 400
 
-        qty = int(max_loss_usd // loss_per_contract)  # floor
+        qty = int(max_loss_usd // loss_per_contract)
         if qty <= 0:
             return jsonify({"error": "Computed qty <= 0 (increase max_loss or stop)"}), 400
         projected_max_loss_usd = max_loss_usd
@@ -592,7 +583,6 @@ def buy():
 
         projected_max_loss_usd = round(qty * loss_per_contract, 2)
 
-    # Place order on IB thread (pass entry |delta| to anchor fixed stops/protects)
     try:
         result = submit_ib_job(
             pos_manager.open_position,
@@ -601,7 +591,7 @@ def buy():
             projected_max_loss_usd,
             auto_protect_flag,
             protect_ratio_value,
-            delta_abs,  # NEW
+            delta_abs,
         )
     except OrderExecutionError as e:
         return jsonify({"error": str(e)}), 400
@@ -621,9 +611,9 @@ def buy():
 def sell():
     """
     Body JSON:
-      { "qty": 3 }            → sell 3
-      { "mode": "half" }      → sell floor(current_qty/2)
-      { "mode": "all" }       → sell all
+      { "qty": 3 }       → sell 3
+      { "mode": "half" } → sell floor(current_qty/2)
+      { "mode": "all" }  → sell all
     """
     if not pos_manager:
         return jsonify({"error": "Engine not ready"}), 503
@@ -690,8 +680,8 @@ def projected_loss():
     """
     Manual sizing projection (no position required).
     Query params:
-      qty (int)             : number of contracts you intend to buy
-      stop_on_spy (float)   : stop distance on the underlying (e.g. 0.25)
+      qty (int)
+      stop_on_spy (float)
     Returns:
       loss_per_contract ($) and projected_max_loss_usd ($) using live delta.
     """
@@ -717,7 +707,7 @@ def projected_loss():
     return jsonify({
         "qty": qty,
         "stop_on_spy": stop_on_spy,
-        "delta": round(delta, 4),             # signed for display
+        "delta": round(delta, 4),
         "loss_per_contract": round(loss_per_contract, 2),
         "projected_max_loss_usd": projected,
     })
@@ -794,7 +784,7 @@ def start_backend():
     ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
     ib.reqMarketDataType(1)  # 1=LIVE
 
-    # --- Track account-level daily PnL via streaming subscription -----------------
+    # --- PnL setup (works across ib_insync versions) --------------------------
     managed_accounts: list[str] = []
     try:
         managed_accounts = ib.managedAccounts()
@@ -804,72 +794,60 @@ def start_backend():
 
     pnl_state_lock = threading.Lock()
     pnl_state: dict[str, float | None] = {"daily": None, "account_value": None}
+    pnl_sub = None
+    using_global_pnl_event = False
 
-    pnl_stream = None
-
-    account_summary_subscription = None
-
-    def _ensure_pnl_stream(account_name: str | None):
-        nonlocal account_id, pnl_stream
-        if not account_name or pnl_stream is not None:
+    def _apply_pnl_update(account, daily, acct_value):
+        if account_id and account and account != account_id:
             return
-        try:
-            pnl_stream = ib.reqPnL(account=account_name, modelCode='')
-            pnl_stream.updateEvent += _capture_account_pnl
-            account_id = account_name
-        except Exception:
-            pnl_stream = None
-
-    def _ensure_account_summary_subscription():
-        nonlocal account_summary_subscription
-        if account_summary_subscription is not None:
-            return
-        try:
-            account_summary_subscription = ib.reqAccountSummary('All', 'All')
-        except Exception:
-            account_summary_subscription = None
-
-    def _capture_account_pnl(*args):
-        """Persist latest daily PnL (and optional account value) from reqPnL stream."""
-
-        daily_candidate = None
-        account_value_candidate = None
-
-        for source in args:
-            if source is None:
-                continue
-            if daily_candidate is None:
-                raw_daily = getattr(source, 'dailyPnL', None)
-                if raw_daily is not None:
-                    try:
-                        daily_float = float(raw_daily)
-                    except Exception:
-                        daily_float = None
-                    else:
-                        if math.isfinite(daily_float):
-                            daily_candidate = daily_float
-            if account_value_candidate is None:
-                raw_value = getattr(source, 'value', None)
-                if raw_value is not None:
-                    try:
-                        value_float = float(raw_value)
-                    except Exception:
-                        value_float = None
-                    else:
-                        if math.isfinite(value_float):
-                            account_value_candidate = value_float
-
-        if daily_candidate is None and account_value_candidate is None:
-            return
-
         with pnl_state_lock:
-            if daily_candidate is not None:
-                pnl_state["daily"] = daily_candidate
-            if account_value_candidate is not None:
-                pnl_state["account_value"] = account_value_candidate
+            if daily is not None and math.isfinite(daily):
+                pnl_state["daily"] = float(daily)
+            if acct_value is not None and math.isfinite(acct_value):
+                pnl_state["account_value"] = float(acct_value)
+        # reflect to snapshot immediately
+        with _snapshot_lock:
+            portfolio = _snapshot.get('portfolio')
+            if not isinstance(portfolio, dict):
+                portfolio = {}
+                _snapshot['portfolio'] = portfolio
+            if pnl_state["daily"] is not None:
+                portfolio["daily_pnl"] = round(pnl_state["daily"], 2)
 
-    _ensure_pnl_stream(account_id)
-    _ensure_account_summary_subscription()
+    def _on_pnl_new_api(pnl_obj):
+        account = getattr(pnl_obj, 'account', None)
+        daily   = _to_float(getattr(pnl_obj, 'dailyPnL', None))
+        value   = _to_float(getattr(pnl_obj, 'value', None))
+        _apply_pnl_update(account, daily, value)
+
+    def _on_pnl_old_api(*args):
+        # Either (PnLObject,) or (account, modelCode, daily, unrl, rld, value)
+        if len(args) == 1 and hasattr(args[0], 'dailyPnL'):
+            pnl_obj = args[0]
+            account = getattr(pnl_obj, 'account', None)
+            daily   = _to_float(getattr(pnl_obj, 'dailyPnL', None))
+            value   = _to_float(getattr(pnl_obj, 'value', None))
+            _apply_pnl_update(account, daily, value)
+            return
+        if len(args) >= 6:
+            account, modelCode, dailyPnL, unrealizedPnL, realizedPnL, value = args[:6]
+            daily = _to_float(dailyPnL)
+            acctv = _to_float(value)
+            _apply_pnl_update(account, daily, acctv)
+
+    if account_id:
+        try:
+            tmp = ib.reqPnL(account=account_id, modelCode='')
+            if hasattr(tmp, 'updateEvent'):
+                pnl_sub = tmp
+                tmp.updateEvent += _on_pnl_new_api
+                print(f"Subscribed reqPnL (object) for {account_id}")
+            else:
+                ib.pnlEvent += _on_pnl_old_api
+                using_global_pnl_event = True
+                print(f"Subscribed reqPnL (global event) for {account_id}")
+        except Exception as e:
+            print(f"PnL subscription failed: {e}")
 
     # Underlying contract + RTVolume (233) for better "last"
     stk = Stock(UNDERLYING_SYMBOL, 'SMART', 'USD', primaryExchange='ARCA')
@@ -903,7 +881,6 @@ def start_backend():
 
     opt = Option(UNDERLYING_SYMBOL, exp, float(strike), OPTION_RIGHT, OPTION_EXCHANGE, currency='USD')
     ib.qualifyContracts(opt)
-    # request greeks/implied vol reliably
     t_opt = ib.reqMktData(opt, '106', False, False)
 
     local_symbol = opt.localSymbol or f"{UNDERLYING_SYMBOL} {exp} {strike} {OPTION_RIGHT}"
@@ -920,11 +897,10 @@ def start_backend():
         "t_und": t_und,
         "t_opt": t_opt,
         "right": OPTION_RIGHT,
-        "local_symbol": local_symbol,   # machine label kept
-        "display_name": readable,       # human label for UI
+        "local_symbol": local_symbol,
+        "display_name": readable,
     })
 
-    # cache strikes & current selection (for fast strict-OTM reseat)
     _cached_strikes = sorted({float(s) for s in row.strikes})
     _current_strike = float(strike)
     _current_exp = exp
@@ -933,7 +909,7 @@ def start_backend():
     with _snapshot_lock:
         _snapshot.update({
             "status": f"connected (clientId={TWS_CLIENT_ID})",
-            "contract": readable,        # send readable to UI
+            "contract": readable,
             "right": OPTION_RIGHT
         })
 
@@ -948,7 +924,6 @@ def start_backend():
         new_opt = Option(UNDERLYING_SYMBOL, _current_exp, float(new_strike), right, OPTION_EXCHANGE, currency='USD')
         ib.qualifyContracts(new_opt)
 
-        # cancel previous stream and subscribe new (with greeks)
         try:
             if t_opt is not None:
                 ib.cancelMktData(t_opt.contract)
@@ -956,7 +931,6 @@ def start_backend():
             pass
         new_ticker = ib.reqMktData(new_opt, '106', False, False)
 
-        # swap live references
         t_opt = new_ticker
         _engine["t_opt"] = new_ticker
         pos_manager.contract = new_opt
@@ -965,7 +939,6 @@ def start_backend():
         _engine["local_symbol"] = local_symbol
         _engine["display_name"] = readable2
 
-        # update current markers
         _current_strike = float(new_strike)
         _last_switch_ts = datetime.now().timestamp()
 
@@ -978,7 +951,7 @@ def start_backend():
         while True:
             ib.sleep(REFRESH_SECONDS)
 
-            # ---- Process any queued IB jobs (buy/sell/right switch) ----
+            # Process any queued IB jobs (buy/sell/right switch)
             while True:
                 try:
                     fn, args, kwargs, reply_q = ib_jobs.get_nowait()
@@ -990,7 +963,7 @@ def start_backend():
                 except Exception as e:
                     reply_q.put((False, e))
 
-            # ---- Auto-roll to strictly OTM when flat (fast & deterministic) ----
+            # Auto-roll to strictly OTM when flat
             if ENFORCE_STRICT_OTM and not pos_manager.has_open():
                 und_px_live = t_und.marketPrice()
                 if math.isfinite(und_px_live) and und_px_live > 0:
@@ -1000,22 +973,14 @@ def start_backend():
                         if _current_strike is None or float(desired) != _current_strike:
                             reseat_option(desired)
 
-            # ---- Periodically refresh account summary / portfolio snapshot ----
+            # Periodically refresh account summary / portfolio snapshot
             now_ts = datetime.now().timestamp()
             if (now_ts - last_account_refresh) >= ACCOUNT_REFRESH_SECONDS:
                 last_account_refresh = now_ts
-                _ensure_account_summary_subscription()
-                summary_rows = None
-                if account_summary_subscription is not None:
-                    try:
-                        summary_rows = list(account_summary_subscription)
-                    except Exception:
-                        summary_rows = None
-                if summary_rows is None:
-                    try:
-                        summary_rows = ib.accountSummary()
-                    except Exception:
-                        summary_rows = None
+                try:
+                    summary_rows = ib.accountSummary()
+                except Exception:
+                    summary_rows = None
                 if summary_rows:
                     tags_of_interest = {
                         "NetLiquidation",
@@ -1029,9 +994,6 @@ def start_backend():
                         tag = getattr(row, 'tag', None)
                         if tag not in tags_of_interest:
                             continue
-                        currency = getattr(row, 'currency', None)
-                        if currency and currency not in ('USD', ''):
-                            continue
                         acct = getattr(row, 'account', None) or ''
                         if account_id and acct and acct != account_id:
                             continue
@@ -1044,26 +1006,22 @@ def start_backend():
                     elif per_account:
                         first_account = next(iter(per_account))
                         summary_map = per_account[first_account]
-                        if first_account and not account_id:
-                            account_id = first_account
-                        if first_account:
-                            _ensure_pnl_stream(first_account)
 
-                    net_liq = _to_float(summary_map.get('NetLiquidation'))
+                    net_liq = _to_float(summary_map.get('NetLiquidation')) if summary_map else None
                     with pnl_state_lock:
                         fallback_daily = pnl_state.get('daily')
                         fallback_value = pnl_state.get('account_value')
                     if net_liq is None and fallback_value is not None:
                         net_liq = float(fallback_value)
 
-                    daily_pnl = _to_float(summary_map.get('DailyPnL'))
-                    if daily_pnl is None:
+                    daily_pnl = _to_float(summary_map.get('DailyPnL')) if summary_map else None
+                    if daily_pnl is None and summary_map:
                         daily_pnl = _to_float(summary_map.get('PnL'))
                     if daily_pnl is None and fallback_daily is not None:
                         daily_pnl = float(fallback_daily)
 
-                    buying_power_val = _to_float(summary_map.get('BuyingPower'))
-                    if buying_power_val is None:
+                    buying_power_val = _to_float(summary_map.get('BuyingPower')) if summary_map else None
+                    if buying_power_val is None and summary_map:
                         buying_power_val = _to_float(summary_map.get('AvailableFunds'))
 
                     daily_pct = None
@@ -1072,24 +1030,12 @@ def start_backend():
                         and daily_pnl is not None and math.isfinite(daily_pnl)
                     ):
                         prior_close_value = net_liq - daily_pnl
-                        if prior_close_value:
+                        if prior_close_value != 0:
                             daily_pct = (daily_pnl / prior_close_value) * 100.0
 
-                    net_liq_val = (
-                        round(net_liq, 2)
-                        if (net_liq is not None and math.isfinite(net_liq))
-                        else None
-                    )
-                    daily_pnl_val = (
-                        round(daily_pnl, 2)
-                        if (daily_pnl is not None and math.isfinite(daily_pnl))
-                        else None
-                    )
-                    daily_pct_val = (
-                        round(daily_pct, 2)
-                        if (daily_pct is not None and math.isfinite(daily_pct))
-                        else None
-                    )
+                    net_liq_val = round(net_liq, 2) if (net_liq is not None and math.isfinite(net_liq)) else None
+                    daily_pnl_val = round(daily_pnl, 2) if (daily_pnl is not None and math.isfinite(daily_pnl)) else None
+                    daily_pct_val = round(daily_pct, 2) if (daily_pct is not None and math.isfinite(daily_pct)) else None
                     buying_power_num = (
                         round(buying_power_val, 2)
                         if (buying_power_val is not None and math.isfinite(buying_power_val))
@@ -1101,16 +1047,20 @@ def start_backend():
                         if not isinstance(portfolio, dict):
                             portfolio = {}
                             _snapshot['portfolio'] = portfolio
+
+                        prev_daily = portfolio.get('daily_pnl')
+                        prev_daily_pct = portfolio.get('daily_pnl_pct')
+
                         portfolio.update({
                             "net_liquidity": net_liq_val,
-                            "daily_pnl": daily_pnl_val,
-                            "daily_pnl_pct": daily_pct_val,
                             "buying_power": buying_power_num,
                         })
+                        portfolio["daily_pnl"] = daily_pnl_val if daily_pnl_val is not None else prev_daily
+                        portfolio["daily_pnl_pct"] = daily_pct_val if daily_pct_val is not None else prev_daily_pct
 
-            # ---- Update snapshot ----
+            # ---- Update snapshot (quotes/greeks) ----
             now_str = datetime.now().strftime('%H:%M:%S')
-            spy_price_str = format_number_safe(t_und.marketPrice(), 2)
+            spy_price_str = format_number_safe(_engine["t_und"].marketPrice(), 2)
             t_opt_cur = _engine["t_opt"]
             bid_str = format_number_safe(t_opt_cur.bid, 2) if t_opt_cur else "n/a"
             ask_str = format_number_safe(t_opt_cur.ask, 2) if t_opt_cur else "n/a"
@@ -1128,10 +1078,10 @@ def start_backend():
                     "iv": iv_str,
                 })
 
-            # ---- Enforce server-side stop/protect if needed (uses fixed anchors) ----
+            # ---- Enforce server-side stop/protect if needed ----
             pos_manager.monitor_auto_stop()
 
-            # Optional console ticker (prefer readable name)
+            # Optional console ticker
             name_for_print = _engine.get('display_name') or _engine.get('local_symbol') or 'n/a'
             line = f"{now_str} | SPY {spy_price_str} | {name_for_print} | Bid {bid_str} Ask {ask_str} | Δ {delta_str} | IV {iv_str}"
             print(line.ljust(150), end='\r', flush=True)
@@ -1140,17 +1090,16 @@ def start_backend():
         print("\nStopped by user.")
     finally:
         try:
-            if pnl_stream is not None:
-                ib.cancelPnL(pnl_stream)
+            if pnl_sub is not None:
+                ib.cancelPnL(pnl_sub)
         except Exception:
             pass
         try:
-            if account_summary_subscription is not None:
-                ib.cancelAccountSummary(account_summary_subscription)
+            if using_global_pnl_event:
+                ib.pnlEvent -= _on_pnl_old_api  # best-effort detach
         except Exception:
             pass
         ib.disconnect()
 
 if __name__ == "__main__":
     start_backend()
-#
