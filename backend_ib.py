@@ -11,13 +11,18 @@
 #   POST /auto_protect {enabled, protect_ratio?}
 #   POST /set_right {"right":"C"|"P"}  → reselect option (requires flat)
 
-from ib_insync import IB, Stock, Option, MarketOrder
+import asyncio
+import copy
+import json
 from datetime import datetime, timezone
 import math
 import threading
 import queue
 import calendar
-from typing import Any, Callable
+from typing import Any, Callable, Set
+
+from ib_insync import IB, Stock, Option, MarketOrder
+from websockets.server import WebSocketServerProtocol, serve
 from flask import Flask, jsonify, request
 
 # ---------------- Config ----------------
@@ -33,6 +38,7 @@ ACCOUNT_REFRESH_SECONDS: float = 1.0   # cadence for account summary refresh
 
 BACKEND_HOST = '127.0.0.1'
 BACKEND_PORT = 8001
+BACKEND_WS_PORT = 8002
 
 # --- Strict OTM enforcement (auto-roll when flat) ----------------------------
 ENFORCE_STRICT_OTM = True
@@ -119,6 +125,84 @@ _snapshot = {
     },
 }
 _snapshot_lock = threading.Lock()
+
+# ----------- WebSocket streaming ---------
+_ws_clients: Set[WebSocketServerProtocol] = set()
+_ws_loop: asyncio.AbstractEventLoop | None = None
+_ws_ready = threading.Event()
+
+
+def _snapshot_copy() -> dict:
+    with _snapshot_lock:
+        return copy.deepcopy(_snapshot)
+
+
+async def _broadcast_snapshot(snapshot: dict) -> None:
+    if not _ws_clients:
+        return
+    message = json.dumps({"type": "snapshot", "data": snapshot})
+    stale: list[WebSocketServerProtocol] = []
+    for client in list(_ws_clients):
+        try:
+            await client.send(message)
+        except Exception:
+            stale.append(client)
+    for client in stale:
+        _ws_clients.discard(client)
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+def _schedule_snapshot_broadcast() -> None:
+    loop = _ws_loop
+    if loop is None:
+        return
+    snapshot = _snapshot_copy()
+    try:
+        asyncio.run_coroutine_threadsafe(_broadcast_snapshot(snapshot), loop)
+    except RuntimeError:
+        pass
+
+
+async def _ws_handler(websocket: WebSocketServerProtocol) -> None:
+    _ws_clients.add(websocket)
+    try:
+        await websocket.send(json.dumps({"type": "snapshot", "data": _snapshot_copy()}))
+        async for _ in websocket:
+            # We currently treat client messages as keepalive only.
+            pass
+    finally:
+        _ws_clients.discard(websocket)
+
+
+def _start_ws_server() -> None:
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        global _ws_loop
+        _ws_loop = loop
+        asyncio.set_event_loop(loop)
+        server = loop.run_until_complete(
+            serve(
+                _ws_handler,
+                BACKEND_HOST,
+                BACKEND_WS_PORT,
+                ping_interval=20,
+                ping_timeout=20,
+                path="/stream",
+            )
+        )
+        _ws_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            server.close()
+            loop.run_until_complete(server.wait_closed())
+            loop.close()
+
+    threading.Thread(target=_runner, daemon=True).start()
+    _ws_ready.wait()
 
 # -------- Position management -----------
 position_lock = threading.Lock()
@@ -874,6 +958,7 @@ def _ib_set_right(right: str) -> dict:
     with _snapshot_lock:
         _snapshot["contract"] = readable
         _snapshot["right"] = right
+    _schedule_snapshot_broadcast()
 
     return {"right": right, "contract": readable}
 
@@ -884,6 +969,9 @@ def start_backend():
         target=lambda: app.run(host=BACKEND_HOST, port=BACKEND_PORT, debug=False, use_reloader=False, threaded=True),
         daemon=True
     ).start()
+
+    _start_ws_server()
+    print(f"WebSocket stream ready at ws://{BACKEND_HOST}:{BACKEND_WS_PORT}/stream")
 
     ib = IB()
     ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
@@ -918,6 +1006,7 @@ def start_backend():
                 _snapshot['portfolio'] = portfolio
             if pnl_state["daily"] is not None:
                 portfolio["daily_pnl"] = round(pnl_state["daily"], 2)
+        _schedule_snapshot_broadcast()
 
     def _on_pnl_new_api(pnl_obj):
         account = getattr(pnl_obj, 'account', None)
@@ -969,6 +1058,7 @@ def start_backend():
     if not (math.isfinite(und_px) and und_px > 0):
         with _snapshot_lock:
             _snapshot["status"] = "error: no underlying price"
+        _schedule_snapshot_broadcast()
         raise RuntimeError("No live underlying price available.")
 
     # Option selection: nearest expiry + nearest OTM (default right)
@@ -978,6 +1068,7 @@ def start_backend():
     if not rows:
         with _snapshot_lock:
             _snapshot["status"] = "error: no option params"
+        _schedule_snapshot_broadcast()
         raise RuntimeError("No option parameters available.")
 
     row = rows[0]
@@ -1017,8 +1108,12 @@ def start_backend():
             "contract": readable,
             "right": OPTION_RIGHT
         })
+    _schedule_snapshot_broadcast()
 
-    print("Backend streaming... endpoints: /snapshot /position_size /positions /buy /sell /set_right")
+    print(
+        "Backend streaming... endpoints: /snapshot /position_size /positions /buy /sell /set_right | "
+        f"WS ws://{BACKEND_HOST}:{BACKEND_WS_PORT}/stream"
+    )
 
     # Helper to reseat the option to a new strictly-OTM strike (when flat)
     def reseat_option(new_strike: float):
@@ -1049,6 +1144,7 @@ def start_backend():
 
         with _snapshot_lock:
             _snapshot["contract"] = readable2
+        _schedule_snapshot_broadcast()
 
     # Main loop
     last_account_refresh = 0.0
@@ -1162,6 +1258,7 @@ def start_backend():
                         })
                         portfolio["daily_pnl"] = daily_pnl_val if daily_pnl_val is not None else prev_daily
                         portfolio["daily_pnl_pct"] = daily_pct_val if daily_pct_val is not None else prev_daily_pct
+                    _schedule_snapshot_broadcast()
 
             # ---- Update snapshot (quotes/greeks) ----
             now_str = datetime.now().strftime('%H:%M:%S')
@@ -1182,6 +1279,7 @@ def start_backend():
                     "delta": delta_str,
                     "iv": iv_str,
                 })
+            _schedule_snapshot_broadcast()
 
             # ---- Enforce server-side stop/protect if needed ----
             pos_manager.monitor_auto_stop()
