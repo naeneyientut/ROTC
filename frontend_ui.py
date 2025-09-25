@@ -1,17 +1,12 @@
 # frontend_ui.py — pretty panel edition (clean header + footer status bar + unified SELL)
 # Run: python frontend_ui.py  → http://127.0.0.1:8080
 
-import asyncio
-import json
-
+from nicegui import ui, app
 import httpx
 import math
-import websockets
-from nicegui import ui, app
 
 # ---------------- Config / client ----------------
 BACKEND_URL = 'http://127.0.0.1:8001'
-BACKEND_WS_URL = 'ws://127.0.0.1:8002/stream'
 client = httpx.AsyncClient(timeout=3.0)
 REFRESH_SEC = 0.25
 
@@ -231,142 +226,117 @@ def _on_qty_change(_):
 
 qty_in.on('update:model-value', _on_qty_change)
 
-# ---------------- Snapshot stream ----------------
-def _apply_snapshot(d: dict) -> None:
+# ---------------- Pollers ----------------
+async def poll_snapshot():
     global latest_delta, current_side
-
-    # footer status (connected)
-    lbl_status.text = 'Connected'
-    status_dot.classes(replace='dot ok')  # green
-    lbl_time.text = f"{d.get('time', '--:--:--')}"
-
-    # HEADER: price only
-    spy = d.get('spy_price', 'n/a')
-    lbl_header_spy.text = f"{spy}"
-
-    # CONTRACT block
-    contract = d.get('contract', 'n/a')
-    lbl_contract_main.text = contract
-
-    bid = d.get('bid', 'n/a')
-    ask = d.get('ask', 'n/a')
-    lbl_bid.text = fmt_plain(bid)
-    lbl_ask.text = fmt_plain(ask)
-
-    delta = d.get('delta', 'n/a')
-    iv = d.get('iv', 'n/a')
-    lbl_greeks.text = f"Δ {delta} | IV {iv}"
-
-    # one-time side sync
-    srv_right = d.get('right')
-    if current_side is None and srv_right in ('C', 'P'):
-        current_side = srv_right
-        side.value = srv_right
-
-    # keep latest_delta cache
     try:
-        latest_delta = float(delta)
-        if not math.isfinite(latest_delta):
-            latest_delta = None
-    except Exception:
-        latest_delta = None
+        r = await client.get(f'{BACKEND_URL}/snapshot')
+        d = r.json()
 
-    portfolio = d.get('portfolio') if isinstance(d.get('portfolio'), dict) else {}
+        # footer status (connected)
+        lbl_status.text = 'Connected'
+        status_dot.classes(replace='dot ok')  # green
+        lbl_time.text   = f"{d.get('time','--:--:--')}"
 
-    net_liq_val = portfolio.get('net_liquidity')
-    try:
-        net_liq_num = float(net_liq_val)
-        if not math.isfinite(net_liq_num):
-            raise ValueError
-    except Exception:
-        net_liq_num = None
-    if net_liq_num is None:
-        lbl_port_net.text = 'n/a'
-        lbl_port_net.classes(replace='value mono muted')
-    else:
-        lbl_port_net.text = fmt_money(net_liq_num)
-        lbl_port_net.classes(replace='value mono')
+        # HEADER: price only
+        spy  = d.get('spy_price', 'n/a')
+        lbl_header_spy.text = f"{spy}"
 
-    buying_power_val = portfolio.get('buying_power')
-    try:
-        buying_power_num = float(buying_power_val)
-        if not math.isfinite(buying_power_num):
-            raise ValueError
-    except Exception:
-        buying_power_num = None
-    if buying_power_num is None:
-        lbl_port_buying.text = 'n/a'
-        lbl_port_buying.classes(replace='value mono muted')
-    else:
-        lbl_port_buying.text = fmt_money(buying_power_num)
-        lbl_port_buying.classes(replace='value mono')
+        # CONTRACT block
+        contract = d.get('contract', 'n/a')
+        lbl_contract_main.text = contract
 
-    daily_pnl_val = portfolio.get('daily_pnl')
-    try:
-        daily_pnl_num = float(daily_pnl_val)
-        if not math.isfinite(daily_pnl_num):
-            raise ValueError
-    except Exception:
-        daily_pnl_num = None
+        bid = d.get('bid', 'n/a')
+        ask = d.get('ask', 'n/a')
+        lbl_bid.text = fmt_plain(bid)
+        lbl_ask.text = fmt_plain(ask)
 
-    daily_pct_val = portfolio.get('daily_pnl_pct')
-    pct_display = ''
-    pct_num = None
-    try:
-        pct_candidate = float(daily_pct_val)
-        if math.isfinite(pct_candidate):
-            pct_num = pct_candidate
-    except Exception:
-        pct_num = None
-    if pct_num is not None:
-        sign = '+' if pct_num > 0 else ''
-        pct_display = f" ({sign}{pct_num:.2f}%)"
-    elif daily_pct_val not in (None, 'n/a'):
-        pct_display = f" ({daily_pct_val})"
+        delta = d.get('delta', 'n/a')
+        iv    = d.get('iv', 'n/a')
+        lbl_greeks.text = f"Δ {delta} | IV {iv}"
 
-    if daily_pnl_num is None:
-        lbl_port_daily.text = 'n/a'
-        lbl_port_daily.classes(replace='value mono muted')
-    else:
-        pnl_text = fmt_money(daily_pnl_num)
-        lbl_port_daily.text = f"{pnl_text}{pct_display}"
-        if daily_pnl_num > 0:
-            lbl_port_daily.classes(replace='value mono green')
-        elif daily_pnl_num < 0:
-            lbl_port_daily.classes(replace='value mono red')
-        else:
-            lbl_port_daily.classes(replace='value mono')
+        # one-time side sync
+        srv_right = d.get('right')
+        if current_side is None and srv_right in ('C','P'):
+            current_side = srv_right
+            side.value = srv_right
 
-
-async def listen_snapshot_stream() -> None:
-    while True:
+        # keep latest_delta cache
         try:
-            lbl_status.text = 'connecting…'
-            status_dot.classes(replace='dot')
-            async with websockets.connect(BACKEND_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                async for message in ws:
-                    try:
-                        payload = json.loads(message)
-                    except Exception:
-                        continue
+            latest_delta = float(delta)
+        except:
+            latest_delta = None
 
-                    snapshot = None
-                    if isinstance(payload, dict):
-                        if payload.get('type') == 'snapshot':
-                            snapshot = payload.get('data')
-                        else:
-                            snapshot = payload
-                    if snapshot is None and isinstance(payload, dict):
-                        snapshot = payload.get('data')
-                    if snapshot is None:
-                        continue
-                    if isinstance(snapshot, dict):
-                        _apply_snapshot(snapshot)
+        portfolio = d.get('portfolio') if isinstance(d.get('portfolio'), dict) else {}
+
+        net_liq_val = portfolio.get('net_liquidity')
+        try:
+            net_liq_num = float(net_liq_val)
+            if not math.isfinite(net_liq_num):
+                raise ValueError
         except Exception:
-            lbl_status.text = 'Disconnected'
-            status_dot.classes(replace='dot')
-            lbl_time.text = '--:--:--'
-            await asyncio.sleep(1.5)
+            net_liq_num = None
+        if net_liq_num is None:
+            lbl_port_net.text = 'n/a'
+            lbl_port_net.classes(replace='value mono muted')
+        else:
+            lbl_port_net.text = fmt_money(net_liq_num)
+            lbl_port_net.classes(replace='value mono')
+
+        buying_power_val = portfolio.get('buying_power')
+        try:
+            buying_power_num = float(buying_power_val)
+            if not math.isfinite(buying_power_num):
+                raise ValueError
+        except Exception:
+            buying_power_num = None
+        if buying_power_num is None:
+            lbl_port_buying.text = 'n/a'
+            lbl_port_buying.classes(replace='value mono muted')
+        else:
+            lbl_port_buying.text = fmt_money(buying_power_num)
+            lbl_port_buying.classes(replace='value mono')
+
+        daily_pnl_val = portfolio.get('daily_pnl')
+        try:
+            daily_pnl_num = float(daily_pnl_val)
+            if not math.isfinite(daily_pnl_num):
+                raise ValueError
+        except Exception:
+            daily_pnl_num = None
+
+        daily_pct_val = portfolio.get('daily_pnl_pct')
+        pct_display = ''
+        pct_num = None
+        try:
+            pct_candidate = float(daily_pct_val)
+            if math.isfinite(pct_candidate):
+                pct_num = pct_candidate
+        except Exception:
+            pct_num = None
+        if pct_num is not None:
+            sign = '+' if pct_num > 0 else ''
+            pct_display = f" ({sign}{pct_num:.2f}%)"
+        elif daily_pct_val not in (None, 'n/a'):
+            pct_display = f" ({daily_pct_val})"
+
+        if daily_pnl_num is None:
+            lbl_port_daily.text = 'n/a'
+            lbl_port_daily.classes(replace='value mono muted')
+        else:
+            pnl_text = fmt_money(daily_pnl_num)
+            lbl_port_daily.text = f"{pnl_text}{pct_display}"
+            if daily_pnl_num > 0:
+                lbl_port_daily.classes(replace='value mono green')
+            elif daily_pnl_num < 0:
+                lbl_port_daily.classes(replace='value mono red')
+            else:
+                lbl_port_daily.classes(replace='value mono')
+    except Exception:
+        # footer status (disconnected)
+        lbl_status.text = 'Disconnected'
+        status_dot.classes(replace='dot')  # red
+        lbl_time.text   = '--:--:--'
 
 async def poll_position_size():
     """Auto ON: ask backend for suggestion. Auto OFF: live projection mirrored into max-loss field."""
@@ -529,13 +499,9 @@ async def poll_positions():
         qty_in.value = str(backend_qty)  # one-time set per change
         last_backend_qty = backend_qty
 
+ui.timer(REFRESH_SEC, poll_snapshot)
 ui.timer(REFRESH_SEC, poll_position_size)
 ui.timer(REFRESH_SEC, poll_positions)
-
-
-@app.on_event('startup')
-async def _start_snapshot_listener() -> None:
-    asyncio.create_task(listen_snapshot_stream())
 
 # ---------------- Actions ----------------
 def on_toggle_auto(_):
