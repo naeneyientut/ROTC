@@ -12,7 +12,6 @@
 #   POST /set_right {"right":"C"|"P"}  → reselect option (requires flat)
 
 from ib_insync import IB, Stock, Option, MarketOrder
-from ib_insync.wrapper import IBError
 from datetime import datetime, timezone
 import math
 import threading
@@ -636,19 +635,12 @@ def _connect_with_retry(ib: IB, *, attempts: int = 5, base_delay: float = 1.0) -
     delay = base_delay
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            if getattr(ib, "isConnected", None) and ib.isConnected():
-                with contextlib.suppress(Exception):
-                    ib.disconnect()
-                time.sleep(0.2)
             ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
             log_event(f"Connected to TWS on attempt {attempt}")
             return
         except Exception as exc:  # pragma: no cover - requires live TWS
             last_exc = exc
             log_event(f"IB connect attempt {attempt} failed: {exc}")
-            if isinstance(exc, IBError) and getattr(exc, "errorCode", None) == 326:
-                log_event("Client ID already in use; stop retrying.")
-                break
             with contextlib.suppress(Exception):
                 ib.disconnect()
             if attempt >= attempts:
