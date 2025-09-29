@@ -17,6 +17,7 @@ import math
 import threading
 import queue
 import calendar
+import logging
 from typing import Any, Callable
 from flask import Flask, jsonify, request
 
@@ -119,6 +120,48 @@ _snapshot = {
     },
 }
 _snapshot_lock = threading.Lock()
+
+# Console state helpers for clean ticker / event logging
+_console_lock = threading.Lock()
+_console_state = {"last_len": 0}
+
+def _clear_console_line_locked():
+    last_len = _console_state.get("last_len", 0)
+    if last_len > 0:
+        print("\r" + (" " * last_len) + "\r", end="", flush=True)
+        _console_state["last_len"] = 0
+
+def log_event(message: str):
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    with _console_lock:
+        _clear_console_line_locked()
+        print(f"[{timestamp}] {message}", flush=True)
+        _console_state["last_len"] = 0
+
+
+def _build_position_console_details(pos: "Position | None") -> str:
+    if not pos or not getattr(pos, "active", False) or getattr(pos, "qty", 0) <= 0:
+        return ""
+
+    stop_val = getattr(pos, "last_stop_price", None) or getattr(pos, "fixed_stop_price", None)
+    protect_val = getattr(pos, "last_protect_price", None) or getattr(pos, "fixed_protect_price", None)
+
+    parts = [
+        f"POS {int(pos.qty)}@{format_number_safe(getattr(pos, 'avg_price', None), 4)}",
+        f"Stop {format_number_safe(stop_val, 4)}",
+        f"StopΔ {format_number_safe(getattr(pos, 'stop_on_spy', None), 3)}",
+    ]
+
+    if protect_val is not None or getattr(pos, "auto_protect_enabled", False):
+        protect_str = format_number_safe(protect_val, 4)
+        protect_part = f"Protect {protect_str}"
+        protect_ratio = getattr(pos, "protect_ratio", 0.0) or 0.0
+        if getattr(pos, "auto_protect_enabled", False) and protect_ratio:
+            protect_part += f" x{format_number_safe(protect_ratio, 2)}"
+        parts.append(protect_part)
+
+    parts.append(f"MaxLoss {format_number_safe(getattr(pos, 'max_loss_usd', None), 2)}")
+    return " || " + " | ".join(parts)
 
 # -------- Position management -----------
 position_lock = threading.Lock()
@@ -356,7 +399,16 @@ class PositionManager:
             self.pos.last_protect_price = self.pos.fixed_protect_price
             self.pos.protect_triggered = False
 
-        return {"filled": filled, "avg_price": round(avg, 4), "total_qty": int(self.pos.qty)}
+            total_qty = int(self.pos.qty)
+            pos_summary = _build_position_console_details(self.pos)
+
+        log_event(
+            "BUY filled "
+            f"{filled} @ {format_number_safe(avg, 4)} "
+            f"(total {total_qty}){pos_summary}"
+        )
+
+        return {"filled": filled, "avg_price": round(avg, 4), "total_qty": total_qty}
 
     def sell(self, qty: int) -> dict:
         if qty <= 0:
@@ -400,7 +452,16 @@ class PositionManager:
                     self.pos.last_protect_price = None
                     self.pos.entry_qty = int(self.pos.qty)
 
-        return {"sold": filled, "avg_price": round(avg, 4), "remaining": int(self.pos.qty)}
+            remaining = int(self.pos.qty)
+            pos_summary = _build_position_console_details(self.pos)
+
+        log_event(
+            "SELL filled "
+            f"{filled} @ {format_number_safe(avg, 4)} "
+            f"(remaining {remaining}){pos_summary}"
+        )
+
+        return {"sold": filled, "avg_price": round(avg, 4), "remaining": remaining}
 
     def update_auto_protect(self, enabled: bool, protect_ratio: float | None) -> dict:
         with position_lock:
@@ -493,7 +554,7 @@ class PositionManager:
             self._liquidating = True
         try:
             trade = self.ib.placeOrder(self.contract, MarketOrder('SELL', sell_qty))
-            filled, _ = self._await_fill(trade)
+            filled, avg = self._await_fill(trade)
             with position_lock:
                 self.pos.qty -= filled
                 if self.pos.qty <= 0:
@@ -510,8 +571,16 @@ class PositionManager:
                     self.pos.entry_qty = 0
                 elif mark_protected and filled > 0:
                     self.pos.protect_triggered = True
+
+                remaining_qty = int(self.pos.qty)
+                pos_summary = _build_position_console_details(self.pos)
+            event_name = "AUTO-STOP" if action == 'stop' else "AUTO-PROTECT"
+            log_event(
+                f"{event_name} sold {filled} @ {format_number_safe(avg, 4)} "
+                f"(remaining {remaining_qty}){pos_summary}"
+            )
         except OrderExecutionError as oe:
-            print(f"\nAuto-stop order failed: {oe}", flush=True)
+            log_event(f"AUTO-STOP error: {oe}")
             if mark_protected:
                 with position_lock:
                     self.pos.protect_triggered = False
@@ -550,6 +619,12 @@ def submit_ib_job(fn: Callable, *args, **kwargs) -> Any:
 
 # --------------- Flask app ---------------
 app = Flask(__name__)
+
+# Quiet default Flask/Werkzeug request logging; we'll manage console output ourselves.
+werk_log = logging.getLogger('werkzeug')
+werk_log.setLevel(logging.WARNING)
+werk_log.propagate = False
+app.logger.setLevel(logging.WARNING)
 pos_manager: PositionManager | None = None  # set in start_backend()
 
 @app.get('/snapshot')
@@ -1186,10 +1261,18 @@ def start_backend():
             # ---- Enforce server-side stop/protect if needed ----
             pos_manager.monitor_auto_stop()
 
-            # Optional console ticker
+            # Optional console ticker with position context
             name_for_print = _engine.get('display_name') or _engine.get('local_symbol') or 'n/a'
-            line = f"{now_str} | SPY {spy_price_str} | {name_for_print} | Bid {bid_str} Ask {ask_str} | Δ {delta_str} | IV {iv_str}"
-            print(line.ljust(150), end='\r', flush=True)
+            with position_lock:
+                pos_details = _build_position_console_details(pos_manager.pos if pos_manager else None)
+            line = (
+                f"{now_str} | SPY {spy_price_str} | {name_for_print} | Bid {bid_str} "
+                f"Ask {ask_str} | Δ {delta_str} | IV {iv_str}{pos_details}"
+            )
+            with _console_lock:
+                pad = max(0, _console_state.get("last_len", 0) - len(line))
+                print(f"{line}{' ' * pad}", end='\r', flush=True)
+                _console_state["last_len"] = len(line)
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
