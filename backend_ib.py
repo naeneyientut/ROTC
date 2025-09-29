@@ -12,12 +12,15 @@
 #   POST /set_right {"right":"C"|"P"}  → reselect option (requires flat)
 
 from ib_insync import IB, Stock, Option, MarketOrder
+from ib_insync.wrapper import IBError
 from datetime import datetime, timezone
 import math
 import threading
 import queue
 import calendar
+import contextlib
 import logging
+import time
 from typing import Any, Callable
 from flask import Flask, jsonify, request
 
@@ -617,6 +620,47 @@ def submit_ib_job(fn: Callable, *args, **kwargs) -> Any:
     else:
         raise payload
 
+# --------------- Connectivity helpers ---------------
+def _connect_with_retry(ib: IB, *, attempts: int = 5, base_delay: float = 1.0) -> None:
+    """Connect to TWS with retry/backoff so frozen builds survive slow start-up."""
+
+    try:
+        # Give the API a little more breathing room when running from a packed exe.
+        timeout = getattr(ib, "RequestTimeout", None)
+        if isinstance(timeout, (int, float)) and timeout < 15:
+            ib.RequestTimeout = 15  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    last_exc: Exception | None = None
+    delay = base_delay
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            if getattr(ib, "isConnected", None) and ib.isConnected():
+                with contextlib.suppress(Exception):
+                    ib.disconnect()
+                time.sleep(0.2)
+            ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
+            log_event(f"Connected to TWS on attempt {attempt}")
+            return
+        except Exception as exc:  # pragma: no cover - requires live TWS
+            last_exc = exc
+            log_event(f"IB connect attempt {attempt} failed: {exc}")
+            if isinstance(exc, IBError) and getattr(exc, "errorCode", None) == 326:
+                log_event("Client ID already in use; stop retrying.")
+                break
+            with contextlib.suppress(Exception):
+                ib.disconnect()
+            if attempt >= attempts:
+                break
+            time.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
+
+    # If we land here we exhausted retries.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("IB connection attempts exhausted")
+
 # --------------- Flask app ---------------
 app = Flask(__name__)
 
@@ -961,7 +1005,7 @@ def start_backend():
     ).start()
 
     ib = IB()
-    ib.connect(TWS_HOSTNAME, TWS_PORT, clientId=TWS_CLIENT_ID)
+    _connect_with_retry(ib)
     ib.reqMarketDataType(1)  # 1=LIVE
 
     # --- PnL setup (works across ib_insync versions) --------------------------
@@ -976,8 +1020,11 @@ def start_backend():
     pnl_state: dict[str, float | None] = {"daily": None, "account_value": None}
     pnl_sub = None
     using_global_pnl_event = False
+    pnl_state_last_update = time.monotonic()
+    last_pnl_resubscribe_attempt = 0.0
 
     def _apply_pnl_update(account, daily, acct_value):
+        nonlocal pnl_state_last_update
         if account_id and account and account != account_id:
             return
         with pnl_state_lock:
@@ -985,6 +1032,7 @@ def start_backend():
                 pnl_state["daily"] = float(daily)
             if acct_value is not None and math.isfinite(acct_value):
                 pnl_state["account_value"] = float(acct_value)
+        pnl_state_last_update = time.monotonic()
         # reflect to snapshot immediately
         with _snapshot_lock:
             portfolio = _snapshot.get('portfolio')
@@ -1143,6 +1191,42 @@ def start_backend():
                 except Exception as e:
                     reply_q.put((False, e))
 
+            # Ensure the PnL feed keeps streaming; frozen builds sometimes miss the
+            # initial apiStart signal which stalls updates. If no update has arrived
+            # for a little while, resubscribe proactively.
+            now_monotonic = time.monotonic()
+            if (
+                account_id
+                and pnl_sub is not None
+                and not using_global_pnl_event
+                and (now_monotonic - pnl_state_last_update) > 10.0
+                and (now_monotonic - last_pnl_resubscribe_attempt) > 10.0
+            ):
+                last_pnl_resubscribe_attempt = now_monotonic
+                log_event("PnL stream stale (>10s); attempting to resubscribe")
+                try:
+                    if hasattr(pnl_sub, 'updateEvent'):
+                        pnl_sub.updateEvent -= _on_pnl_new_api
+                except Exception:
+                    pass
+                with contextlib.suppress(Exception):
+                    ib.cancelPnL(pnl_sub)
+                try:
+                    tmp = ib.reqPnL(account=account_id, modelCode='')
+                    if hasattr(tmp, 'updateEvent'):
+                        tmp.updateEvent += _on_pnl_new_api
+                        pnl_sub = tmp
+                        pnl_state_last_update = time.monotonic()
+                        log_event("PnL stream reattached")
+                    else:
+                        ib.pnlEvent += _on_pnl_old_api
+                        pnl_sub = tmp
+                        using_global_pnl_event = True
+                        pnl_state_last_update = time.monotonic()
+                        log_event("Switched to global pnlEvent stream")
+                except Exception as e:
+                    log_event(f"PnL resubscribe failed: {e}")
+
             # Auto-roll to strictly OTM when flat
             if ENFORCE_STRICT_OTM and not pos_manager.has_open():
                 und_px_live = t_und.marketPrice()
@@ -1235,8 +1319,22 @@ def start_backend():
                             "net_liquidity": net_liq_val,
                             "buying_power": buying_power_num,
                         })
-                        portfolio["daily_pnl"] = daily_pnl_val if daily_pnl_val is not None else prev_daily
-                        portfolio["daily_pnl_pct"] = daily_pct_val if daily_pct_val is not None else prev_daily_pct
+                        fallback_daily_val = None
+                        if fallback_daily is not None and math.isfinite(fallback_daily):
+                            fallback_daily_val = round(float(fallback_daily), 2)
+
+                        effective_daily = (
+                            daily_pnl_val
+                            if daily_pnl_val is not None
+                            else fallback_daily_val
+                            if fallback_daily_val is not None
+                            else prev_daily
+                        )
+                        portfolio["daily_pnl"] = effective_daily
+
+                        portfolio["daily_pnl_pct"] = (
+                            daily_pct_val if daily_pct_val is not None else prev_daily_pct
+                        )
 
             # ---- Update snapshot (quotes/greeks) ----
             now_str = datetime.now().strftime('%H:%M:%S')
