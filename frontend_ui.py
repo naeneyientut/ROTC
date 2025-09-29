@@ -8,7 +8,7 @@ import math
 # ---------------- Config / client ----------------
 BACKEND_URL = 'http://127.0.0.1:8001'
 client = httpx.AsyncClient(timeout=3.0)
-REFRESH_SEC = 0.25
+REFRESH_SEC = 0.1
 
 latest_delta = None           # cache latest delta for projections
 current_side = None           # last side confirmed by backend: 'C' or 'P'
@@ -681,4 +681,9 @@ async def do_sell():
         ui.notify(f'Sell failed: {e}', color='negative')
 btn_sell.on('click', do_sell)
 
-ui.run(title='Rapid Options Trader Cockpit for IBKR', window_size=(460, 970), fullscreen=False, reload=False, port=8080)
+def start_ui():
+    # ui elements already defined above
+    ui.run(title='Rapid Options Trader Cockpit for IBKR', window_size=(460, 970), fullscreen=False, reload=False, port=8080)
+
+if __name__ == '__main__':
+    start_ui()

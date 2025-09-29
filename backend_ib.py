@@ -22,13 +22,13 @@ from flask import Flask, jsonify, request
 
 # ---------------- Config ----------------
 TWS_HOSTNAME: str      = '127.0.0.1'
-TWS_PORT: int          = 7490           # your working port
+TWS_PORT: int          = 7490          # your working port
 TWS_CLIENT_ID: int     = 101
 
 UNDERLYING_SYMBOL: str = 'SPY'
 OPTION_RIGHT: str      = 'C'            # default; UI can change via /set_right
 OPTION_EXCHANGE: str   = 'SMART'
-REFRESH_SECONDS: float = 0.25
+REFRESH_SECONDS: float = 0.1
 ACCOUNT_REFRESH_SECONDS: float = 1.0   # cadence for account summary refresh
 
 BACKEND_HOST = '127.0.0.1'
