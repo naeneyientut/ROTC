@@ -54,10 +54,35 @@ def pick_nearest_expiration(expiration_strings):
     pool = future_expirations if future_expirations else list(expiration_strings)
     return pick_nearest_by_key(pool, key_func=lambda e: datetime.strptime(e, '%Y%m%d').date())
 
+def _sanitize_strikes(strike_values):
+    """Return a sorted list of unique, finite strikes with product-specific filters."""
+    floats: list[float] = []
+    for s in strike_values:
+        try:
+            val = float(s)
+        except Exception:
+            continue
+        if math.isfinite(val):
+            floats.append(val)
+
+    unique_sorted_strikes = sorted({float(v) for v in floats})
+
+    if UNDERLYING_SYMBOL.upper() == 'SPY':
+        whole_dollar = {
+            float(round(v))
+            for v in unique_sorted_strikes
+            if abs(v - round(v)) < 1e-6
+        }
+        if whole_dollar:
+            unique_sorted_strikes = sorted(whole_dollar)
+
+    return unique_sorted_strikes
+
+
 def pick_nearest_otm_strike(strike_values, underlying_price, option_right):
-    if not strike_values:
+    unique_sorted_strikes = _sanitize_strikes(strike_values)
+    if not unique_sorted_strikes:
         raise RuntimeError("No strikes available to select from.")
-    unique_sorted_strikes = sorted({float(s) for s in strike_values})
     r = option_right.upper()
     if r == 'C':
         otm = [s for s in unique_sorted_strikes if s > underlying_price]
@@ -976,7 +1001,7 @@ def _ib_set_right(right: str) -> dict:
     pos_manager.contract = opt
 
     # refresh cached strikes and current selection state
-    _cached_strikes = sorted({float(s) for s in row.strikes})
+    _cached_strikes = _sanitize_strikes(row.strikes)
     _current_strike = float(strike)
     _current_exp = exp
     _last_switch_ts = datetime.now().timestamp()
@@ -1121,7 +1146,7 @@ def start_backend():
         "display_name": readable,
     })
 
-    _cached_strikes = sorted({float(s) for s in row.strikes})
+    _cached_strikes = _sanitize_strikes(row.strikes)
     _current_strike = float(strike)
     _current_exp = exp
     _last_switch_ts = datetime.now().timestamp()
